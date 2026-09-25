@@ -397,7 +397,7 @@ fn test_last_lifecycle_entry_matches_current_record() {
     client.add_verifier(&admin, &verifier);
 
     client.approve(&verifier, &subject, &2, &9000, &js(&env, "FR"));
-    client.update_tier(&verifier, &subject, &3);
+    client.update_tier(&verifier, &subject, &2);
     client.revoke(&verifier, &subject);
 
     let count = client.get_lifecycle_count(&subject);
@@ -409,15 +409,15 @@ fn test_last_lifecycle_entry_matches_current_record() {
     assert_eq!(hist.get(0).unwrap().tier, 2);
     assert_eq!(hist.get(0).unwrap().expiry, 9000);
 
-    // seq 1: TierUpdate preserves expiry=9000, advances tier to 3
+    // seq 1: TierUpdate preserves expiry=9000, advances tier to 2
     assert_eq!(hist.get(1).unwrap().kind, KycTransitionKind::TierUpdate);
-    assert_eq!(hist.get(1).unwrap().tier, 3);
+    assert_eq!(hist.get(1).unwrap().tier, 2);
     assert_eq!(hist.get(1).unwrap().expiry, 9000);
 
     // seq 2: Revoke — tier and expiry are snapshots of the moment of revocation
     let last = hist.get(2).unwrap();
     assert_eq!(last.kind, KycTransitionKind::Revoke);
-    assert_eq!(last.tier, 3);
+    assert_eq!(last.tier, 2);
 
     // The reconstructed state from the last history entry matches the live record.
     let record = client.get_record(&subject);
@@ -486,7 +486,7 @@ fn test_lifecycle_history_limit_cap_at_50() {
 
     // Create 10 transitions
     for i in 0..5u32 {
-        client.approve(&verifier, &subject, &i, &0, &js(&env, "US"));
+        client.approve(&verifier, &subject, &i.min(2), &0, &js(&env, "US"));
         client.revoke(&verifier, &subject);
     }
 
@@ -754,8 +754,14 @@ fn test_approve_batch_emits_batch_approved_event() {
         }
     }
 
-    assert_eq!(batch_count, 1, "exactly one batch_app event should be emitted");
-    assert_eq!(batch_value, 3u32, "batch_app event should carry the approved count");
+    assert_eq!(
+        batch_count, 1,
+        "exactly one batch_app event should be emitted"
+    );
+    assert_eq!(
+        batch_value, 3u32,
+        "batch_app event should carry the approved count"
+    );
 }
 
 #[test]
@@ -779,6 +785,55 @@ fn test_revoke_batch_records_lifecycle_for_each_subject() {
 
     let h1 = client.get_lifecycle_history(&s1, &1, &1);
     assert_eq!(h1.get(0).unwrap().kind, KycTransitionKind::Revoke);
+}
+
+#[test]
+fn test_revoke_batch_rejects_twenty_one_subjects() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let mut subjects = Vec::new(&env);
+    for _ in 0..21 {
+        subjects.push_back(Address::generate(&env));
+    }
+
+    let res = client.try_revoke_batch(&verifier, &subjects);
+    assert_eq!(res, Err(Ok(Error::from(KycError::BatchTooLarge))));
+}
+
+#[test]
+fn test_approve_batch_rejects_empty_subjects() {
+    let (env, client, _admin) = setup();
+    let verifier = Address::generate(&env);
+    let subjects: Vec<(Address, u32, u64, String)> = Vec::new(&env);
+
+    let res = client.try_approve_batch(&verifier, &subjects);
+    assert_eq!(res, Err(Ok(Error::from(KycError::EmptyBatch))));
+}
+
+#[test]
+fn test_revoke_rejects_invalid_tier_without_state_change() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    let subject = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+    client.approve(&verifier, &subject, &3, &0, &js(&env, "US"));
+
+    let res = client.try_revoke(&verifier, &subject);
+    assert_eq!(res, Err(Ok(Error::from(KycError::InvalidRevokeTier))));
+
+    let record = client.get_record(&subject);
+    assert!(matches!(record.status, KycStatus::Approved));
+    assert_eq!(record.tier, 3);
+}
+
+#[test]
+fn test_is_approved_returns_false_for_unknown_subject() {
+    let (env, client, _admin) = setup();
+    let subject = Address::generate(&env);
+
+    assert!(!client.is_approved(&subject));
 }
 
 // ── Admin and verifier privilege regressions ──────────────────────────────────
@@ -1873,7 +1928,10 @@ fn test_approve_batch_duplicate_subject() {
     assert!(client.is_approved(&addr));
     let record = client.get_record(&addr);
     assert!(matches!(record.status, KycStatus::Approved));
-    assert_eq!(record.tier, 2, "second batch entry should overwrite the first");
+    assert_eq!(
+        record.tier, 2,
+        "second batch entry should overwrite the first"
+    );
     assert_eq!(record.jurisdiction, js(&env, "DE"));
 
     // Two lifecycle transitions were recorded — one per iteration.
@@ -1911,9 +1969,7 @@ fn test_remove_admin_panics_on_empty_admin_list_in_storage() {
     // Corrupt: replace the stored admin list with an empty Vec.
     env.as_contract(&contract_id, || {
         let empty: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
-        env.storage()
-            .instance()
-            .set(&DataKey::AdminList, &empty);
+        env.storage().instance().set(&DataKey::AdminList, &empty);
     });
 
     // With an empty list admin_list() returns the empty Vec, len==0.
@@ -1925,7 +1981,10 @@ fn test_remove_admin_panics_on_empty_admin_list_in_storage() {
     // error variant depends on which guard fires first.  Either way no state
     // mutation should occur.
     let res = client.try_remove_admin(&admin, &second);
-    assert!(res.is_err(), "must error when admin list is empty in storage");
+    assert!(
+        res.is_err(),
+        "must error when admin list is empty in storage"
+    );
 }
 
 /// Fix #2 — approve: explicit empty jurisdiction guard rejects an empty string
@@ -2005,5 +2064,9 @@ fn test_remove_admin_rejects_last_admin_removal() {
     // The admin list must still contain exactly the one remaining admin.
     let admins = client.get_admins();
     assert_eq!(admins.len(), 1, "admin list must still hold one entry");
-    assert_eq!(admins.get(0).unwrap(), second, "the surviving admin must be unchanged");
+    assert_eq!(
+        admins.get(0).unwrap(),
+        second,
+        "the surviving admin must be unchanged"
+    );
 }
