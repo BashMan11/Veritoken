@@ -32,6 +32,8 @@ pub enum KycError {
     BatchTooLarge = 11,
     /// The address is already in the admin list.
     AdminAlreadyExists = 12,
+    EmptyBatch = 15,
+    InvalidRevokeTier = 16,
 }
 
 /// Composite key for per-subject lifecycle history entries.
@@ -391,6 +393,9 @@ impl KycRegistry {
     }
 
     pub fn approve_batch(env: Env, verifier: Address, subjects: Vec<(Address, u32, u64, String)>) {
+        if subjects.is_empty() {
+            panic_with_error!(env, KycError::EmptyBatch);
+        }
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         verifier.require_auth();
         Self::require_verifier(&env, &verifier);
@@ -424,7 +429,7 @@ impl KycRegistry {
             );
         }
         env.events()
-            .publish((symbol_short!("batch_app"),), subjects_count as u32);
+            .publish((symbol_short!("batch_app"),), subjects_count);
     }
 
     pub fn reject(env: Env, verifier: Address, subject: Address) {
@@ -453,6 +458,9 @@ impl KycRegistry {
         verifier.require_auth();
         Self::require_verifier(&env, &verifier);
         let mut record = Self::get_record_or_default(&env, subject.clone(), &verifier);
+        if record.tier > 2 {
+            panic_with_error!(env, KycError::InvalidRevokeTier);
+        }
         record.status = KycStatus::Revoked;
         Self::record_transition(
             &env,
