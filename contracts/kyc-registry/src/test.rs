@@ -418,7 +418,7 @@ fn test_last_lifecycle_entry_matches_current_record() {
     client.add_verifier(&admin, &verifier);
 
     client.approve(&verifier, &subject, &2, &9000, &js(&env, "FR"));
-    client.update_tier(&verifier, &subject, &1);
+    client.update_tier(&verifier, &subject, &2);
     client.revoke(&verifier, &subject);
 
     let count = client.get_lifecycle_count(&subject);
@@ -430,15 +430,15 @@ fn test_last_lifecycle_entry_matches_current_record() {
     assert_eq!(hist.get(0).unwrap().tier, 2);
     assert_eq!(hist.get(0).unwrap().expiry, 9000);
 
-    // seq 1: TierUpdate preserves expiry=9000, advances tier to 1
+    // seq 1: TierUpdate preserves expiry=9000, advances tier to 2
     assert_eq!(hist.get(1).unwrap().kind, KycTransitionKind::TierUpdate);
-    assert_eq!(hist.get(1).unwrap().tier, 1);
+    assert_eq!(hist.get(1).unwrap().tier, 2);
     assert_eq!(hist.get(1).unwrap().expiry, 9000);
 
     // seq 2: Revoke — tier and expiry are snapshots of the moment of revocation
     let last = hist.get(2).unwrap();
     assert_eq!(last.kind, KycTransitionKind::Revoke);
-    assert_eq!(last.tier, 1);
+    assert_eq!(last.tier, 2);
 
     // The reconstructed state from the last history entry matches the live record.
     let record = client.get_record(&subject);
@@ -507,7 +507,7 @@ fn test_lifecycle_history_limit_cap_at_50() {
 
     // Create 10 transitions
     for i in 0..5u32 {
-        client.approve(&verifier, &subject, &i, &0, &js(&env, "US"));
+        client.approve(&verifier, &subject, &i.min(2), &0, &js(&env, "US"));
         client.revoke(&verifier, &subject);
     }
 
@@ -820,6 +820,55 @@ fn test_revoke_batch_records_lifecycle_for_each_subject() {
 
     let h1 = client.get_lifecycle_history(&s1, &1, &1);
     assert_eq!(h1.get(0).unwrap().kind, KycTransitionKind::Revoke);
+}
+
+#[test]
+fn test_revoke_batch_rejects_twenty_one_subjects() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+
+    let mut subjects = Vec::new(&env);
+    for _ in 0..21 {
+        subjects.push_back(Address::generate(&env));
+    }
+
+    let res = client.try_revoke_batch(&verifier, &subjects);
+    assert_eq!(res, Err(Ok(Error::from(KycError::BatchTooLarge))));
+}
+
+#[test]
+fn test_approve_batch_rejects_empty_subjects() {
+    let (env, client, _admin) = setup();
+    let verifier = Address::generate(&env);
+    let subjects: Vec<(Address, u32, u64, String)> = Vec::new(&env);
+
+    let res = client.try_approve_batch(&verifier, &subjects);
+    assert_eq!(res, Err(Ok(Error::from(KycError::EmptyBatch))));
+}
+
+#[test]
+fn test_revoke_rejects_invalid_tier_without_state_change() {
+    let (env, client, admin) = setup();
+    let verifier = Address::generate(&env);
+    let subject = Address::generate(&env);
+    client.add_verifier(&admin, &verifier);
+    client.approve(&verifier, &subject, &3, &0, &js(&env, "US"));
+
+    let res = client.try_revoke(&verifier, &subject);
+    assert_eq!(res, Err(Ok(Error::from(KycError::InvalidRevokeTier))));
+
+    let record = client.get_record(&subject);
+    assert!(matches!(record.status, KycStatus::Approved));
+    assert_eq!(record.tier, 3);
+}
+
+#[test]
+fn test_is_approved_returns_false_for_unknown_subject() {
+    let (env, client, _admin) = setup();
+    let subject = Address::generate(&env);
+
+    assert!(!client.is_approved(&subject));
 }
 
 // ── Admin and verifier privilege regressions ──────────────────────────────────

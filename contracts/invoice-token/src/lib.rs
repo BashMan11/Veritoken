@@ -307,6 +307,32 @@ impl InvoiceToken {
         Self::do_create_invoice(&env, meta);
     }
 
+    /// List invoice IDs with pagination (zero-based offset, page size 1–50).
+    /// Panics with `InvalidMetadata` when `page_size` is zero or exceeds 50.
+    pub fn get_invoices_page(env: Env, page: u32, page_size: u32) -> Vec<String> {
+        env.storage().instance().extend_ttl(THRESHOLD, BUMP);
+        const MAX_PAGE_SIZE: u32 = 50;
+        if page_size == 0 || page_size > MAX_PAGE_SIZE {
+            panic_with_error!(env, InvoiceError::InvalidMetadata);
+        }
+        let list: Vec<String> = env
+            .storage()
+            .instance()
+            .get(&DataKey::InvoicesList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let total = list.len();
+        let start = page.saturating_mul(page_size);
+        let mut result: Vec<String> = Vec::new(&env);
+        if start >= total {
+            return result;
+        }
+        let end = (start + page_size).min(total);
+        for i in start..end {
+            result.push_back(list.get(i).expect("index in bounds"));
+        }
+        result
+    }
+
     /// List invoice IDs with pagination (zero-based offset, capped at 50).
     pub fn list_invoices(env: Env, start: u32, limit: u32) -> Vec<String> {
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
@@ -352,6 +378,31 @@ impl InvoiceToken {
             .persistent()
             .set(&DataKey::InvoiceMeta(invoice_id), &new_meta);
         env.events().publish((symbol_short!("upd_meta"),), ());
+    }
+
+    /// Set or clear an invoice's notification webhook. Admin-only.
+    /// An empty string explicitly clears the webhook; any other value must be
+    /// a valid "https://" URL and is validated before storage is written.
+    pub fn set_webhook(env: Env, invoice_id: String, webhook: String) {
+        th::require_admin(&env);
+        let key = DataKey::InvoiceMeta(invoice_id.clone());
+        let mut meta: InvoiceMeta = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(env, InvoiceError::InvoiceNotFound));
+        if webhook.is_empty() {
+            meta.notification_webhook = String::from_str(&env, "");
+            env.storage().persistent().set(&key, &meta);
+            env.events()
+                .publish((symbol_short!("wh_clear"),), invoice_id);
+            return;
+        }
+        Self::validate_webhook(&env, &webhook);
+        meta.notification_webhook = webhook.clone();
+        env.storage().persistent().set(&key, &meta);
+        env.events()
+            .publish((symbol_short!("wh_set"),), (invoice_id, webhook));
     }
 
     pub fn name(env: Env) -> String {
@@ -456,6 +507,11 @@ impl InvoiceToken {
             .persistent()
             .get(&DataKey::InvoiceMeta(invoice_id.clone()))
             .expect("invoice must exist");
+
+        // Guard: face_value_usd must be positive before any state is written.
+        if meta.face_value_usd <= 0 {
+            panic_with_error!(env, InvoiceError::UnderSettlement);
+        }
 
         let from_status = Self::read_status(&env, &invoice_id);
         if matches!(
@@ -596,6 +652,11 @@ impl InvoiceToken {
         env.storage().instance().extend_ttl(THRESHOLD, BUMP);
         from.require_auth();
         Self::require_lifecycle_active(&env);
+
+        // Guard: redemption amount must be positive before any state is read or written.
+        if amount <= 0 {
+            panic_with_error!(env, InvoiceError::UnderSettlement);
+        }
 
         let status = Self::read_status(&env, &invoice_id);
         if !matches!(
@@ -1287,7 +1348,15 @@ impl InvoiceToken {
         if meta.face_value_usd <= 0 {
             panic_with_error!(env, InvoiceError::InvalidMetadata);
         }
+        // Discount rate is expressed in basis points; anything above 100% is malformed.
+        if meta.discount_rate_bps > 10_000 {
+            panic_with_error!(env, InvoiceError::InvalidMetadata);
+        }
         if !th::is_valid_ipfs_hash(&meta.ipfs_doc_hash) {
+            panic_with_error!(env, InvoiceError::InvalidMetadata);
+        }
+        // Fee is amount * bps / 10_000; above 100% the net transfer goes negative.
+        if meta.transfer_fee_bps > 10_000 {
             panic_with_error!(env, InvoiceError::InvalidMetadata);
         }
     }
@@ -1296,6 +1365,10 @@ impl InvoiceToken {
         Self::validate_webhook(env, &meta.notification_webhook);
         Self::validate_invoice_meta(env, &meta);
         let invoice_id = meta.invoice_id.clone();
+        // Guard: invoice_id must not be empty.
+        if invoice_id.is_empty() {
+            panic_with_error!(env, InvoiceError::InvalidMetadata);
+        }
         if env
             .storage()
             .persistent()

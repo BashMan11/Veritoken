@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use crate::{InvoiceMeta, InvoiceStatus, InvoiceToken, InvoiceTokenClient};
+use crate::{InvoiceError, InvoiceMeta, InvoiceStatus, InvoiceToken, InvoiceTokenClient};
 use compliance_engine::{ComplianceEngine, ComplianceEngineClient, ComplianceRules};
 use kyc_registry::{KycRegistry, KycRegistryClient};
 use soroban_sdk::{
@@ -596,6 +596,26 @@ fn test_webhook_http_is_rejected() {
 }
 
 #[test]
+fn test_create_invoice_rejects_transfer_fee_above_100_percent() {
+    use crate::InvoiceError;
+    use soroban_sdk::Error;
+    let h = setup();
+
+    let mut m = h.make_invoice("INV-FEE-MAX");
+    m.transfer_fee_bps = 10_000;
+    h.token.create_invoice(&m);
+
+    let mut bad = h.make_invoice("INV-FEE-BAD");
+    bad.transfer_fee_bps = 10_001;
+    let res = h.token.try_create_invoice(&bad);
+    assert_eq!(
+        res.unwrap_err().unwrap(),
+        Error::from(InvoiceError::InvalidMetadata)
+    );
+    assert!(h.token.try_get_meta(&bad.invoice_id).is_err());
+}
+
+#[test]
 fn test_webhook_non_url_is_rejected() {
     let h = setup();
     let mut m = h.make_invoice("INV-WEBHOOK-4");
@@ -1103,6 +1123,78 @@ fn test_update_meta_webhook_validated_on_update() {
     let mut m = h.token.get_meta(&inv_id(&h.env));
     m.notification_webhook = String::from_str(&h.env, "ftp://bad-scheme.example.com");
     assert!(h.token.try_update_meta(&inv_id(&h.env), &m).is_err());
+}
+
+#[test]
+fn test_set_webhook_empty_clears_webhook() {
+    let h = setup();
+    let id = inv_id(&h.env);
+    h.token
+        .set_webhook(&id, &String::from_str(&h.env, "https://example.com/hook"));
+    assert_eq!(
+        h.token.get_meta(&id).notification_webhook,
+        String::from_str(&h.env, "https://example.com/hook")
+    );
+    // Blank value is an explicit clear, not an ambiguous stored value.
+    h.token.set_webhook(&id, &String::from_str(&h.env, ""));
+    assert_eq!(
+        h.token.get_meta(&id).notification_webhook,
+        String::from_str(&h.env, "")
+    );
+    // Whitespace-only is not a blank clear and is rejected without touching state.
+    assert_eq!(
+        h.token
+            .try_set_webhook(&id, &String::from_str(&h.env, "   ")),
+        Err(Ok(InvoiceError::InvalidWebhook.into()))
+    );
+    assert!(h.token.get_meta(&id).notification_webhook.is_empty());
+}
+
+#[test]
+fn test_duplicate_invoice_id_rejected_before_state_write() {
+    let h = setup();
+    let mut dup = meta(&h.env);
+    dup.face_value_usd = 1;
+    assert_eq!(
+        h.token.try_create_invoice(&dup),
+        Err(Ok(InvoiceError::InvoiceAlreadyExists.into()))
+    );
+    // Original metadata and the invoice list are untouched.
+    assert_eq!(
+        h.token.get_meta(&inv_id(&h.env)).face_value_usd,
+        1_000_000_000_000
+    );
+    assert_eq!(h.token.list_invoices(&0, &50).len(), 1);
+}
+
+#[test]
+fn test_create_invoice_rejects_out_of_range_discount_rate() {
+    let h = setup();
+    let mut m = h.make_invoice("INV-DISC-MAX");
+    m.discount_rate_bps = 10_000;
+    h.token.create_invoice(&m);
+
+    let mut bad = h.make_invoice("INV-DISC-BAD");
+    bad.discount_rate_bps = 10_001;
+    assert_eq!(
+        h.token.try_create_invoice(&bad),
+        Err(Ok(InvoiceError::InvalidMetadata.into()))
+    );
+    assert_eq!(h.token.list_invoices(&0, &50).len(), 2);
+}
+
+#[test]
+fn test_create_invoice_rejects_non_positive_face_value() {
+    let h = setup();
+    for (id, fv) in [("INV-FV-ZERO", 0i128), ("INV-FV-NEG", -1i128)] {
+        let mut m = h.make_invoice(id);
+        m.face_value_usd = fv;
+        assert_eq!(
+            h.token.try_create_invoice(&m),
+            Err(Ok(InvoiceError::InvalidMetadata.into()))
+        );
+    }
+    assert_eq!(h.token.list_invoices(&0, &50).len(), 1);
 }
 
 // ── Lifecycle pause tests ─────────────────────────────────────────────────────
@@ -1747,4 +1839,130 @@ fn test_batch_settle_capped_at_10() {
     let results = h.token.batch_settle(&settlements);
     // Only 10 should be processed.
     assert_eq!(results.len(), 10);
+}
+
+// ── Regression tests: validation guards (get_invoices_page, settle, redeem, create_invoice) ─────
+
+/// get_invoices_page: page_size = 0 must be rejected before any list read.
+#[test]
+fn test_get_invoices_page_zero_page_size_rejected() {
+    let h = setup();
+    // page_size = 0 is invalid and must panic before touching the list.
+    assert!(
+        h.token.try_get_invoices_page(&0, &0).is_err(),
+        "page_size=0 must be rejected"
+    );
+}
+
+/// get_invoices_page: page_size > 50 must be rejected before any list read.
+#[test]
+fn test_get_invoices_page_oversized_page_size_rejected() {
+    let h = setup();
+    // page_size = 51 exceeds the hard cap of 50.
+    assert!(
+        h.token.try_get_invoices_page(&0, &51).is_err(),
+        "page_size=51 must be rejected"
+    );
+}
+
+/// get_invoices_page: valid page_size (1–50) returns the correct slice.
+#[test]
+fn test_get_invoices_page_valid_returns_correct_slice() {
+    let h = setup();
+    h.token.create_invoice(&h.make_invoice("PG-002"));
+    h.token.create_invoice(&h.make_invoice("PG-003"));
+
+    // 3 invoices total; page 0, size 2 → first 2.
+    let page0 = h.token.get_invoices_page(&0, &2);
+    assert_eq!(page0.len(), 2);
+
+    // page 1, size 2 → last 1.
+    let page1 = h.token.get_invoices_page(&1, &2);
+    assert_eq!(page1.len(), 1);
+
+    // page 2 is past the end → empty.
+    let page2 = h.token.get_invoices_page(&2, &2);
+    assert_eq!(page2.len(), 0);
+
+    // page_size = 50 (max allowed) must not be rejected.
+    let big = h.token.get_invoices_page(&0, &50);
+    assert_eq!(big.len(), 3);
+}
+
+/// settle: the normal path (face_value_usd > 0) must still succeed after the guard.
+#[test]
+fn test_settle_normal_path_unchanged() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+    h.token.issue(&inv_id(&h.env), &holder, &100);
+
+    // Normal settle must succeed.
+    h.token.settle(&inv_id(&h.env));
+    assert!(h.token.is_settled(&inv_id(&h.env)));
+    // settlement_amount must equal face_value_usd.
+    assert_eq!(
+        h.token.settlement_amount(&inv_id(&h.env)),
+        1_000_000_000_000i128
+    );
+}
+
+/// redeem: amount = 0 must be rejected before any balance read or write.
+#[test]
+fn test_redeem_zero_amount_rejected() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+    h.token.issue(&inv_id(&h.env), &holder, &1_000);
+    h.token.settle(&inv_id(&h.env));
+
+    // Zero-amount redeem must fail before any state mutation.
+    assert!(
+        h.token.try_redeem(&inv_id(&h.env), &holder, &0).is_err(),
+        "redeem(0) must be rejected"
+    );
+
+    // Balance and supply must be unchanged.
+    assert_eq!(h.token.balance(&holder, &inv_id(&h.env)), 1_000);
+    assert_eq!(h.token.total_supply(&inv_id(&h.env)), 1_000);
+}
+
+/// redeem: negative amount must also be rejected.
+#[test]
+fn test_redeem_negative_amount_rejected() {
+    let h = setup();
+    let holder = Address::generate(&h.env);
+    h.approve_kyc(&holder);
+    h.token.issue(&inv_id(&h.env), &holder, &1_000);
+    h.token.settle(&inv_id(&h.env));
+
+    assert!(
+        h.token.try_redeem(&inv_id(&h.env), &holder, &-1).is_err(),
+        "redeem(-1) must be rejected"
+    );
+}
+
+/// create_invoice: empty invoice_id must be rejected before any storage write.
+#[test]
+fn test_create_invoice_empty_id_rejected() {
+    let h = setup();
+    let mut bad_meta = h.make_invoice("PLACEHOLDER");
+    // Override invoice_id with an empty string.
+    bad_meta.invoice_id = String::from_str(&h.env, "");
+
+    assert!(
+        h.token.try_create_invoice(&bad_meta).is_err(),
+        "empty invoice_id must be rejected"
+    );
+
+    // The invoices list must still contain exactly the one invoice from setup().
+    assert_eq!(h.token.list_invoices(&0, &50).len(), 1);
+}
+
+/// create_invoice: non-empty invoice_id is accepted (normal path unchanged).
+#[test]
+fn test_create_invoice_non_empty_id_accepted() {
+    let h = setup();
+    h.token.create_invoice(&h.make_invoice("VALID-ID"));
+    assert_eq!(h.token.list_invoices(&0, &50).len(), 2);
 }
